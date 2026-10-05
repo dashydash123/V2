@@ -1,6 +1,7 @@
 """
 Validation checks for the Workday headcount / termination views.
-Answers: are there rehires, what status values exist, how old are the leavers.
+Answers: are there rehires, what status values exist, how old are the leavers,
+and WHY there are duplicate rows (which columns differ between them).
 
 Reads the same .env as get_workday_leavers.py. Run it the same way:
     python validate_workday.py
@@ -86,6 +87,52 @@ CHECKS = {
 }
 
 
+def duplicate_columns(conn, view, label, writer):
+    """For people with more than one row, which columns actually differ?"""
+    query = f"""
+        SELECT * FROM {view}
+        WHERE global_employee_id IN (
+            SELECT global_employee_id FROM {view}
+            WHERE global_employee_id IS NOT NULL
+            GROUP BY global_employee_id HAVING COUNT(*) > 1)
+    """
+    with conn.cursor() as cur:
+        cur.execute(query)
+        dup = cur.fetchall_arrow().to_pandas()
+
+    people = dup["global_employee_id"].nunique()
+    print(f"\n=== duplicates_{label} ===")
+    print(f"{len(dup)} rows belong to {people} people with more than one row")
+    if not people:
+        return
+
+    # Number of people whose rows disagree on each column
+    differs = (dup.groupby("global_employee_id").nunique(dropna=False) > 1).sum()
+    summary = (differs[differs > 0].sort_values(ascending=False)
+               .rename("people_with_different_values").to_frame())
+    summary["pct_of_duplicated_people"] = (
+        summary["people_with_different_values"] / people * 100).round(1)
+    summary.index.name = "column"
+    summary = summary.reset_index()
+    print(summary.to_string(index=False) if len(summary)
+          else "(rows are exact copies - every column identical)")
+
+    # Rows per person, to see whether it is 2 rows each or a few with many
+    spread = (dup.groupby("global_employee_id").size().value_counts()
+              .sort_index().rename("people").to_frame())
+    spread.index.name = "rows_per_person"
+    print(spread.reset_index().to_string(index=False))
+
+    summary.to_excel(writer, sheet_name=f"dup_columns_{label}"[:31], index=False)
+    spread.reset_index().to_excel(writer, sheet_name=f"dup_spread_{label}"[:31],
+                                  index=False)
+    # A handful of real examples to eyeball (first 15 people)
+    sample_ids = dup["global_employee_id"].drop_duplicates().head(15)
+    (dup[dup["global_employee_id"].isin(sample_ids)]
+     .sort_values("global_employee_id")
+     .to_excel(writer, sheet_name=f"dup_sample_{label}"[:31], index=False))
+
+
 def main():
     if not TOKEN:
         sys.exit("No DATABRICKS_TOKEN found - check your .env file")
@@ -102,6 +149,10 @@ def main():
             print(f"\n=== {name} ===")
             print(df.to_string(index=False) if len(df) else "(no rows)")
             df.to_excel(writer, sheet_name=name[:31], index=False)
+
+        # 6 & 7. What makes the duplicate rows different
+        duplicate_columns(conn, HC, "headcount", writer)
+        duplicate_columns(conn, TM, "termination", writer)
 
     print(f"\nSaved to {out}")
 
