@@ -62,6 +62,12 @@ CLIENT_SECRET = env("DATABRICKS_CLIENT_SECRET")
 # is BEFORE this date are left out of the HR roster (raw sheets keep everything).
 CUTOFF_DATE = env("TERMINATION_CUTOFF_DATE")
 
+# Rehire rule: someone present in the headcount view (Active / OnLeave) is
+# treated as employed even if the termination view holds a past date for them.
+# Grace period guards against snapshot lag: a termination this many days old
+# or newer still counts as a leaver. 0 = headcount always wins.
+REHIRE_GRACE_DAYS = int(env("REHIRE_GRACE_DAYS", "0") or 0)
+
 OUTPUT_DIR = env("OUTPUT_DIR", "output")
 LOG_FILE = env("LOG_FILE", os.path.join(OUTPUT_DIR, "workday_hr_roster.log"))
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -97,17 +103,18 @@ TERM_DATE_COL = "termination_date"
 MAPPING_NOTES = {
     "id": "global_employee_id (join key). Rows with no global ID are excluded.",
     "email": "employee_email, falls back to upn when blank.",
-    "employmentStatus": "In termination view with date <= today -> Not employed; "
-                        "future termination date -> Employed; otherwise headcount "
-                        "employee_status: Active -> Employed, on leave -> On leave, "
-                        "anything else -> Not monitored.",
+    "employmentStatus": "Still in the headcount view -> employee_status wins "
+                        "(Active -> Employed, on leave -> On leave), even with a "
+                        "past termination date (rehire). Otherwise in termination "
+                        "view -> Not employed; future termination date -> Employed; "
+                        "no headcount row and no status -> Not monitored.",
     "location": "zone (e.g. ZONE EUROPE).",
     "department": "function_l1_desc - CONFIRM this is the department level wanted.",
     "employeeId": "local_employee_id - CONFIRM (same as global ID for many rows).",
     "employeeType": "Left blank for now (no agreed value mapping yet).",
     "hireDate": "Left blank for now (no hire date column in the views).",
     "terminationDate": "termination_date (latest per employee), yyyy-mm-dd; "
-                       "future dates are kept.",
+                       "future dates are kept; cleared for rehires.",
     "costCenter": "cost_center_desc - this is a description, not a code.",
     "isDeleted": "TRUE when employmentStatus is Not employed, else FALSE.",
 }
@@ -136,6 +143,8 @@ def setup_logging():
     log.info("Warehouse: %s%s", HOST, HTTP_PATH)
     log.info("Schema: %s.%s", CATALOG, SCHEMA)
     log.info("Termination cutoff: %s", CUTOFF_DATE or "none (all leavers)")
+    log.info("Rehire rule: headcount wins%s",
+             f" (grace {REHIRE_GRACE_DAYS} days)" if REHIRE_GRACE_DAYS else "")
 
 
 # ---------------- connection ----------------
@@ -294,16 +303,40 @@ def build_hr_roster(headcount, termination, cutoff=None):
     roster["_tdate"] = roster["id"].map(tdates)
     in_term = roster["id"].isin(tm["_gid"])
 
-    def status(row, termed):
+    in_hc = pd.Series([True] * len(hc_out) + [False] * len(tm_out),
+                      index=roster.index)
+    grace = pd.Timedelta(days=REHIRE_GRACE_DAYS)
+
+    def status(row, termed, in_headcount):
+        tdate = row["_tdate"]
+        if termed and pd.notna(tdate) and tdate > today:
+            return "Employed"              # future leaver - still employed
+        if in_headcount:
+            # Rehire rule: a past termination is overridden by the live
+            # headcount row, unless it is inside the grace period.
+            if termed and REHIRE_GRACE_DAYS and pd.notna(tdate) \
+                    and tdate >= today - grace:
+                return "Not employed"
+            return _headcount_status(row["_hc_status"])
         if termed:
-            if pd.notna(row["_tdate"]) and row["_tdate"] > today:
-                return "Employed"          # future leaver - still employed
             return "Not employed"
         return _headcount_status(row["_hc_status"])
 
     roster["employmentStatus"] = [
-        status(r, t) for (_, r), t in zip(roster.iterrows(), in_term)]
-    roster["terminationDate"] = roster["_tdate"].dt.strftime("%Y-%m-%d")
+        status(r, t, h) for (_, r), t, h
+        in zip(roster.iterrows(), in_term, in_hc)]
+    past_term = in_term & (roster["_tdate"] <= today)
+    future_dated = int((in_term & (roster["_tdate"] > today)).sum())
+    rehires = int((past_term & in_hc &
+                   (roster["employmentStatus"] != "Not employed")).sum())
+    log.info("Rehires kept employed (past termination, still in headcount): %s",
+             rehires)
+    # A rehire's old termination date would be misleading next to an active
+    # status, so only keep dates for leavers and future-dated terminations.
+    keep_tdate = (roster["employmentStatus"] == "Not employed") | (
+        roster["_tdate"] > today)
+    roster["terminationDate"] = roster["_tdate"].where(
+        keep_tdate).dt.strftime("%Y-%m-%d")
     roster["hireDate"] = _to_date(roster["hireDate"]).dt.strftime("%Y-%m-%d")
     roster["isDeleted"] = (roster["employmentStatus"] == "Not employed").map(
         {True: "TRUE", False: "FALSE"})
@@ -334,8 +367,9 @@ def build_hr_roster(headcount, termination, cutoff=None):
         ["Not employed", int(counts.get("Not employed", 0))],
         ["Not monitored", int(counts.get("Not monitored", 0))],
         ["Leavers only in termination view (added)", len(tm_out)],
-        ["Future-dated leavers (still Employed)",
-         int((in_term & (roster["employmentStatus"] == "Employed")).sum())],
+        ["Rehires (past termination, kept employed)", rehires],
+        ["Rehire grace period (days)", REHIRE_GRACE_DAYS],
+        ["Future-dated leavers (still Employed)", future_dated],
         ["Headcount duplicates removed", hc_dupes],
         ["Termination duplicates removed", tm_dupes],
         ["Headcount rows excluded (no global ID)", hc_no_id],
