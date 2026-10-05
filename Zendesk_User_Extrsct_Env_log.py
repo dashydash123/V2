@@ -37,6 +37,9 @@ python zendesk_user_extract.py
 # Account lifecycle: every row is labelled new / active / suspended / deactivated.
 # --recent-days sets what "new" and "recently deactivated" mean (default 30)
 python zendesk_user_extract.py --all-time --exclude-end-users --recent-days 30
+# account_segment (New / Existing / Suspended / Deactivated) is one column the
+# dashboard can use as a single slicer. With --all-time, deleted users are read
+# from /api/v2/deleted_users so the Deactivated segment is filled.
 # Subsets: new accounts only, deactivated only, or both together (new OR deactivated)
 python zendesk_user_extract.py --all-time --new-only
 python zendesk_user_extract.py --all-time --deactivated-only
@@ -106,6 +109,7 @@ CSV_COLUMNS = [
     "days_since_created",       # whole days since created_at
     "is_new_account",           # TRUE if created within --recent-days (default 30)
     "account_status",           # Active / Suspended / Deactivated (Zendesk active=false = deleted)
+    "account_segment",          # one slicer for the dashboard: Deactivated / Suspended / New / Existing
     "is_recently_deactivated",  # TRUE if Deactivated and updated_at is within --recent-days.
                                 # Zendesk gives no deactivation date; updated_at is the closest proxy.
 ]
@@ -296,6 +300,41 @@ def fetch_users_since(session: requests.Session, base: str, start_epoch: int) ->
 
     return users
 
+def fetch_deleted_users(session: requests.Session, base: str) -> list[dict]:
+    """
+    GET /api/v2/deleted_users - users deleted in Zendesk but not yet permanently
+    removed. The plain users list (used for --all-time) leaves them out, so
+    without this call every --all-time extract would show 0 deactivated accounts.
+    The records carry role, created_at and updated_at (roughly the deletion
+    time) but no role_type, custom role or last login.
+    Never fatal: if the endpoint is not available the run carries on without it.
+    """
+    url: str | None = f"{base}/api/v2/deleted_users"
+    params: dict | None = {"page[size]": 100}
+    users: list[dict] = []
+    page = 0
+    try:
+        while url:
+            page += 1
+            data = get_json(session, url, params)
+            batch = data.get("deleted_users", [])
+            users.extend(batch)
+            print(f" deleted users page {page}: +{len(batch)} (running total {len(users)})",
+                  file=sys.stderr)
+            if not (data.get("meta") or {}).get("has_more"):
+                break
+            url = (data.get("links") or {}).get("next")
+            params = None
+            time.sleep(0.3)
+    except (requests.RequestException, SystemExit) as exc:
+        reason = exc.code if isinstance(exc, SystemExit) else exc
+        print(f" WARNING: could not read deleted users ({reason}). "
+              f"Deactivated accounts will be missing from this extract.", file=sys.stderr)
+        return []
+    for u in users:
+        u["active"] = False          # deleted = deactivated, whatever the record says
+    return users
+
 def fetch_users_list(session: requests.Session, base: str, roles: list[str] | None = None) -> list[dict]:
     """
     Plain GET /api/v2/users with cursor pagination (page[size]/page[after]).
@@ -437,6 +476,13 @@ def account_status(user: dict) -> str:
         return "Suspended"
     return "Active"
 
+def account_segment(status: str, is_new: str) -> str:
+    """Single dashboard segment. Deactivated and Suspended win over New, so a
+    brand-new account that was already removed shows as Deactivated."""
+    if status in ("Deactivated", "Suspended"):
+        return status
+    return "New" if is_new == "TRUE" else "Existing"
+
 def account_lifecycle(user: dict, status: str, now: datetime, recent_days: int) -> tuple[str, str, str]:
     """Return (days_since_created, is_new_account, is_recently_deactivated)."""
     created = parse_ts(user.get("created_at"))
@@ -478,6 +524,7 @@ def to_row(user: dict, custom_roles: dict[int, str], now: datetime, threshold: i
         "days_since_created": days_created,
         "is_new_account": is_new,
         "account_status": status,
+        "account_segment": account_segment(status, is_new),
         "is_recently_deactivated": recently_deact,
     }
 
@@ -637,6 +684,14 @@ def main() -> None:
         label = "roles: agent, admin (end users filtered server-side)" if role_filter else "all roles"
         print(f"Fetching users (full list, {label})...", file=sys.stderr)
         raw_users = fetch_users_list(session, base, roles=role_filter)
+        if not args.active_only:
+            print("Fetching deleted users (for the Deactivated segment)...", file=sys.stderr)
+            deleted = fetch_deleted_users(session, base)
+            if args.exclude_end_users:
+                deleted = [u for u in deleted if u.get("role") in ("agent", "admin")]
+            print(f" {len(deleted)} deleted agent/admin account(s) added", file=sys.stderr)
+            # Live records go last so they win the de-duplication below
+            raw_users = deleted + raw_users
     else:
         print("Fetching users (incremental export)...", file=sys.stderr)
         raw_users = fetch_users_since(session, base, int(start_dt.timestamp()))
@@ -733,9 +788,13 @@ def main() -> None:
     print(f"  deactivated (active = false): {deact_n}   "
           f"({recent_deact_n} changed in the last {args.recent_days} days, by updated_at)", file=sys.stderr)
     print(f"  suspended: {susp_n}", file=sys.stderr)
-    if deact_n == 0 and not (args.active_only or args.new_only):
-        print("  Note: no deactivated accounts in this extract. Zendesk may list deleted users "
-              "separately, and this script does not read that list.", file=sys.stderr)
+    seg = Counter(r["account_segment"] for r in rows)
+    print("  account_segment: " + ", ".join(f"{k} {seg.get(k, 0)}" for k in
+                                             ("New", "Existing", "Suspended", "Deactivated")),
+          file=sys.stderr)
+    print("  Note: an agent whose licence is removed by downgrading them to end user is not "
+          "'Deactivated' here - with --exclude-end-users they simply drop out of the extract.",
+          file=sys.stderr)
 
     if args.check_ticket_activity:
         no_tix = sum(1 for r in rows if r["no_tickets_90d"] == "TRUE")
