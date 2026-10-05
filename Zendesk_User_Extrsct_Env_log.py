@@ -34,6 +34,12 @@ python zendesk_user_extract.py --start 2026-01-01 --end 2026-06-30 --date-field 
 python zendesk_user_extract.py --start 2026-01-01 --end 2026-06-30 --exclude-end-users --exclude-seat-class "Light agent,Contributor"
 # Run using the default arguments stored in the .env file
 python zendesk_user_extract.py
+# Account lifecycle: every row is labelled new / active / suspended / deactivated.
+# --recent-days sets what "new" and "recently deactivated" mean (default 30)
+python zendesk_user_extract.py --all-time --exclude-end-users --recent-days 30
+# Subsets: new accounts only, deactivated only, or both together (new OR deactivated)
+python zendesk_user_extract.py --all-time --new-only
+python zendesk_user_extract.py --all-time --deactivated-only
 
 Security
 --------
@@ -96,12 +102,22 @@ CSV_COLUMNS = [
     "no_tickets_90d",     # TRUE if no assigned/submitted ticket activity in the last 90 days
     "reclaim_candidate",  # TRUE only if login dormant AND no ticket activity found
     "organization_id",
+    # --- account lifecycle (for dashboard slicing) ---
+    "days_since_created",       # whole days since created_at
+    "is_new_account",           # TRUE if created within --recent-days (default 30)
+    "account_status",           # Active / Suspended / Deactivated (Zendesk active=false = deleted)
+    "is_recently_deactivated",  # TRUE if Deactivated and updated_at is within --recent-days.
+                                # Zendesk gives no deactivation date; updated_at is the closest proxy.
 ]
 
 # Only a recorded last login older than this counts as inactive. A user with no
 # last_login_at is NOT flagged - there is no date to measure against. Kept as a
 # named constant so the threshold is easy to change.
 INACTIVITY_DAYS = 90
+
+# What counts as "recent" for the account lifecycle columns: a new account was
+# created within this many days; a recently deactivated one changed within it.
+RECENT_DAYS = 30
 
 SEARCH_PAUSE = 0.7        # search is rate limited harder than the users endpoint
 
@@ -413,9 +429,30 @@ def login_recency(last_login_at: str | None, now: datetime, threshold: int) -> t
     days = (now - ts).days
     return str(days), "TRUE" if days > threshold else "FALSE"
 
-def to_row(user: dict, custom_roles: dict[int, str], now: datetime, threshold: int) -> dict:
+def account_status(user: dict) -> str:
+    """Deactivated = Zendesk active is false (deleted user); Suspended = suspended is true."""
+    if user.get("active") is False:
+        return "Deactivated"
+    if user.get("suspended") is True:
+        return "Suspended"
+    return "Active"
+
+def account_lifecycle(user: dict, status: str, now: datetime, recent_days: int) -> tuple[str, str, str]:
+    """Return (days_since_created, is_new_account, is_recently_deactivated)."""
+    created = parse_ts(user.get("created_at"))
+    updated = parse_ts(user.get("updated_at"))
+    days_created = (now - created).days if created else ""
+    is_new = "TRUE" if created and (now - created).days < recent_days else "FALSE"
+    recently_deact = ("TRUE" if status == "Deactivated" and updated
+                      and (now - updated).days < recent_days else "FALSE")
+    return days_created, is_new, recently_deact
+
+def to_row(user: dict, custom_roles: dict[int, str], now: datetime, threshold: int,
+           recent_days: int = RECENT_DAYS) -> dict:
     seat_class, custom_name = classify(user, custom_roles)
     days_since_login, inactive = login_recency(user.get("last_login_at"), now, threshold)
+    status = account_status(user)
+    days_created, is_new, recently_deact = account_lifecycle(user, status, now, recent_days)
     return {
         "id": user.get("id"),
         "name": user.get("name") or "",
@@ -438,6 +475,10 @@ def to_row(user: dict, custom_roles: dict[int, str], now: datetime, threshold: i
         "no_tickets_90d": "",
         "reclaim_candidate": "",
         "organization_id": user.get("organization_id") or "",
+        "days_since_created": days_created,
+        "is_new_account": is_new,
+        "account_status": status,
+        "is_recently_deactivated": recently_deact,
     }
 
 # --------------------------------------------------------------------------- #
@@ -549,12 +590,22 @@ def main() -> None:
                    help=f"Days without a login before a seat counts as dormant (default: {INACTIVITY_DAYS})")
     p.add_argument("--inactive-only", action="store_true",
                    help="Keep only dormant seats - the reclaim candidate list")
+    p.add_argument("--recent-days", type=int, default=RECENT_DAYS,
+                   help=f"What counts as recent for is_new_account and is_recently_deactivated (default: {RECENT_DAYS})")
+    p.add_argument("--new-only", action="store_true",
+                   help="Keep only accounts created within --recent-days")
+    p.add_argument("--deactivated-only", action="store_true",
+                   help="Keep only deactivated accounts (active = false). "
+                        "With --new-only as well, keeps accounts that are new OR deactivated")
     p.add_argument("--check-ticket-activity", action="store_true",
                    help="For every exported user, query the Search API for assigned/submitted ticket "
                         "activity in the inactivity window, plus the date of their last ticket. "
                         "2 API calls per user, plus 2 more for users with nothing in the window. "
                         "Fills the ticket columns, no_tickets_90d and reclaim_candidate.")
     args = p.parse_args(command_line_args())
+    if args.active_only and args.deactivated_only:
+        raise SystemExit("--active-only and --deactivated-only contradict each other: "
+                         "--active-only drops exactly the accounts --deactivated-only keeps.")
 
     if not args.start and not args.last_days and not args.all_time:
         raise SystemExit("Give --start YYYY-MM-DD, --last-days N, or --all-time")
@@ -615,13 +666,19 @@ def main() -> None:
         if args.active_only and u.get("active") is False:
             continue
 
-        row = to_row(u, custom_roles, now_utc, args.inactivity_days)
+        row = to_row(u, custom_roles, now_utc, args.inactivity_days, args.recent_days)
         if (row["seat_class"].strip().lower() in drop_classes
                 or row["custom_role_name"].strip().lower() in drop_classes):
             continue
 
         if args.inactive_only and row["inactive_90d"] != "TRUE":
             continue
+
+        if args.new_only or args.deactivated_only:
+            wanted = ((args.new_only and row["is_new_account"] == "TRUE")
+                      or (args.deactivated_only and row["account_status"] == "Deactivated"))
+            if not wanted:
+                continue
         rows.append(row)
 
     if args.check_ticket_activity:
@@ -637,7 +694,9 @@ def main() -> None:
                 r["last_ticket_activity_at"] = last.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 r["days_since_ticket_activity"] = (now_utc - last).days
             r["no_tickets_90d"] = "TRUE" if no_tickets else "FALSE"
-            r["reclaim_candidate"] = "TRUE" if (r["inactive_90d"] == "TRUE" and no_tickets) else "FALSE"
+            # A deactivated (deleted) account holds no seat, so it is never a reclaim candidate
+            r["reclaim_candidate"] = ("TRUE" if (r["inactive_90d"] == "TRUE" and no_tickets
+                                                 and r["account_status"] != "Deactivated") else "FALSE")
             if not no_tickets:
                 flag = f"{assigned + submitted} ticket(s)"
             elif last is not None:
@@ -664,6 +723,19 @@ def main() -> None:
     print(f"\nDormant (last login more than {args.inactivity_days} days ago): {dormant} of {len(rows)}",
           file=sys.stderr)
     print(f"No last login date recorded (not counted as dormant): {never}", file=sys.stderr)
+
+    new_n = sum(1 for r in rows if r["is_new_account"] == "TRUE")
+    deact_n = sum(1 for r in rows if r["account_status"] == "Deactivated")
+    recent_deact_n = sum(1 for r in rows if r["is_recently_deactivated"] == "TRUE")
+    susp_n = sum(1 for r in rows if r["account_status"] == "Suspended")
+    print(f"\nAccount lifecycle (recent = last {args.recent_days} days):", file=sys.stderr)
+    print(f"  new accounts created in the last {args.recent_days} days: {new_n}", file=sys.stderr)
+    print(f"  deactivated (active = false): {deact_n}   "
+          f"({recent_deact_n} changed in the last {args.recent_days} days, by updated_at)", file=sys.stderr)
+    print(f"  suspended: {susp_n}", file=sys.stderr)
+    if deact_n == 0 and not (args.active_only or args.new_only):
+        print("  Note: no deactivated accounts in this extract. Zendesk may list deleted users "
+              "separately, and this script does not read that list.", file=sys.stderr)
 
     if args.check_ticket_activity:
         no_tix = sum(1 for r in rows if r["no_tickets_90d"] == "TRUE")
