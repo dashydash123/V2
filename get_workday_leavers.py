@@ -6,7 +6,8 @@ plus an HR_Roster sheet (Flexera HR roster format) built from the headcount and
 termination views, an HR_Roster_Mapping sheet, and a Flexera-ready CSV.
 
 Setup:
-    pip install databricks-sql-connector databricks-sdk pandas pyarrow openpyxl
+    pip install databricks-sql-connector databricks-sdk pandas pyarrow openpyxl xlsxwriter
+    (xlsxwriter is optional but uses much less memory for the Excel file)
 
 All settings live in a .env file next to this script (see .env.example).
 Nothing secret is written to the log.
@@ -383,6 +384,15 @@ def build_hr_roster(headcount, termination, cutoff=None):
     return roster, mapping_df, stats_df
 
 
+def excel_engine():
+    """xlsxwriter uses far less memory than openpyxl when it's installed."""
+    try:
+        import xlsxwriter  # noqa: F401
+        return "xlsxwriter"
+    except ImportError:
+        return "openpyxl"
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out = os.path.join(OUTPUT_DIR,
@@ -392,10 +402,10 @@ def main():
 
     index_rows, failures = [], 0
     used = {"index", "hr_roster", "hr_roster_mapping"}
-    frames = {}
+    frames, plan = {}, []          # plan: (sheet names, dataframe)
 
-    with connect() as conn, conn.cursor() as cur, \
-            pd.ExcelWriter(out, engine="openpyxl") as writer:
+    # 1. Fetch every view first, then close the connection
+    with connect() as conn, conn.cursor() as cur:
         objects = list_objects(cur)
         if not objects:
             raise ValueError(f"No readable tables/views found in {CATALOG}.{SCHEMA}")
@@ -407,17 +417,11 @@ def main():
                 cur.execute(f"SELECT * FROM {full}")
                 df = clean_for_excel(cur.fetchall_arrow().to_pandas())
                 frames[table_name.lower()] = df
-
-                # Split across extra sheets if over Excel's row limit
                 chunks = range(0, max(len(df), 1), EXCEL_MAX_ROWS)
-                sheets = []
-                for i, start in enumerate(chunks):
-                    label = table_name if i == 0 else f"{table_name}_{i + 1}"
-                    name = sheet_name(label, used)
-                    df.iloc[start:start + EXCEL_MAX_ROWS].to_excel(
-                        writer, sheet_name=name, index=False)
-                    sheets.append(name)
-
+                sheets = [sheet_name(table_name if i == 0 else
+                                     f"{table_name}_{i + 1}", used)
+                          for i, _ in enumerate(chunks)]
+                plan.append((sheets, df))
                 index_rows.append([", ".join(sheets), full, table_type,
                                    len(df), "OK"])
                 log.info("%s: %s rows", full, len(df))
@@ -426,41 +430,45 @@ def main():
                 index_rows.append(["", full, table_type, None, f"FAILED: {e}"])
                 log.error("%s: FAILED - %s", full, e)
 
-        # Build the Flexera HR roster from headcount + termination
-        try:
-            if HEADCOUNT_VIEW not in frames or TERMINATION_VIEW not in frames:
-                raise ValueError("headcount or termination view not loaded")
-            roster, mapping_df, stats_df = build_hr_roster(
-                frames[HEADCOUNT_VIEW], frames[TERMINATION_VIEW], cutoff)
+    # 2. Build the Flexera HR roster and its CSV
+    roster = mapping_df = stats_df = None
+    try:
+        if HEADCOUNT_VIEW not in frames or TERMINATION_VIEW not in frames:
+            raise ValueError("headcount or termination view not loaded")
+        roster, mapping_df, stats_df = build_hr_roster(
+            frames[HEADCOUNT_VIEW], frames[TERMINATION_VIEW], cutoff)
+        roster.to_csv(csv_out, index=False, encoding="utf-8-sig")
+        index_rows.insert(0, ["HR_Roster, HR_Roster_Mapping",
+                              f"Built from {HEADCOUNT_VIEW} + {TERMINATION_VIEW}",
+                              "DERIVED", len(roster),
+                              f"OK - CSV: {os.path.basename(csv_out)}"])
+        log.info("HR_Roster: %s rows -> %s", len(roster), csv_out)
+    except Exception as e:
+        failures += 1
+        index_rows.insert(0, ["HR_Roster", "Derived roster", "DERIVED",
+                              None, f"FAILED: {e}"])
+        log.error("HR_Roster: FAILED - %s", e)
+
+    # 3. Write the workbook once, already in the right sheet order:
+    #    Index, HR_Roster, HR_Roster_Mapping, then the raw views.
+    #    (No re-opening afterwards - that is what ran out of memory.)
+    engine = excel_engine()
+    log.info("Writing %s (engine: %s)...", out, engine)
+    with pd.ExcelWriter(out, engine=engine) as writer:
+        pd.DataFrame(index_rows, columns=["Sheet", "Source object", "Type",
+                                          "Rows", "Status"]
+                     ).to_excel(writer, sheet_name="Index", index=False)
+        if roster is not None:
             roster.to_excel(writer, sheet_name="HR_Roster", index=False)
             mapping_df.to_excel(writer, sheet_name="HR_Roster_Mapping",
                                 index=False)
             stats_df.to_excel(writer, sheet_name="HR_Roster_Mapping",
                               index=False, startrow=len(mapping_df) + 3)
-            roster.to_csv(csv_out, index=False, encoding="utf-8-sig")
-            index_rows.insert(0, ["HR_Roster, HR_Roster_Mapping",
-                                  f"Built from {HEADCOUNT_VIEW} + {TERMINATION_VIEW}",
-                                  "DERIVED", len(roster),
-                                  f"OK - CSV: {os.path.basename(csv_out)}"])
-            log.info("HR_Roster: %s rows -> %s", len(roster), csv_out)
-        except Exception as e:
-            failures += 1
-            index_rows.insert(0, ["HR_Roster", "Derived roster", "DERIVED",
-                                  None, f"FAILED: {e}"])
-            log.error("HR_Roster: FAILED - %s", e)
-
-        pd.DataFrame(index_rows, columns=["Sheet", "Source object", "Type",
-                                          "Rows", "Status"]
-                     ).to_excel(writer, sheet_name="Index", index=False)
-
-    # Sheet order: Index, HR_Roster, HR_Roster_Mapping, then raw views
-    from openpyxl import load_workbook
-    wb = load_workbook(out)
-    front = [wb[n] for n in ("Index", "HR_Roster", "HR_Roster_Mapping")
-             if n in wb.sheetnames]
-    wb._sheets = front + [ws for ws in wb._sheets if ws not in front]
-    wb.active = 0
-    wb.save(out)
+        for sheets, df in plan:
+            for i, name in enumerate(sheets):
+                start = i * EXCEL_MAX_ROWS
+                df.iloc[start:start + EXCEL_MAX_ROWS].to_excel(
+                    writer, sheet_name=name, index=False)
 
     log.info("Saved %s objects to %s", len(objects), out)
     if failures:
